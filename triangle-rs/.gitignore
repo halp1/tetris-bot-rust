@@ -1,0 +1,4 @@
+/target
+tests/data/replays
+triangle.js
+.env

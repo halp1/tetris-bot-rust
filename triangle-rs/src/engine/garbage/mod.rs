@@ -1,0 +1,348 @@
+use crate::engine::utils::rng::Rng;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GarbageQueueInitParams {
+  pub cap: GarbageCapParams,
+  pub messiness: MessinessParams,
+  pub garbage: GarbageSpeedParams,
+  pub multiplier: MultiplierParams,
+  pub bombs: bool,
+  pub seed: i64,
+  pub board_width: usize,
+  pub rounding: RoundingMode,
+  pub opener_phase: u32,
+  pub special_bonus: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GarbageCapParams {
+  pub value: f64,
+  pub margin_time: u64,
+  pub increase: f64,
+  pub absolute: u32,
+  pub max: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessinessParams {
+  pub change: f64,
+  pub within: f64,
+  pub nosame: bool,
+  pub timeout: u64,
+  pub center: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GarbageSpeedParams {
+  pub speed: u64,
+  pub hole_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiplierParams {
+  pub value: f64,
+  pub increase: f64,
+  pub margin_time: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoundingMode {
+  Down,
+  Rng,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingGarbage {
+  pub frame: u64,
+  pub amount: u32,
+  pub size: usize,
+  pub cid: u64,
+  pub gameid: u64,
+  pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutgoingGarbage {
+  pub frame: u64,
+  pub amount: u32,
+  pub size: usize,
+  pub id: u64,
+  pub column: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GarbageQueueSnapshot {
+  pub seed: i64,
+  pub last_tank_time: u64,
+  pub last_column: Option<usize>,
+  pub sent: u32,
+  pub has_changed_column: bool,
+  pub last_received_count: u64,
+  pub queue: Vec<IncomingGarbage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GarbageQueue {
+  pub options: GarbageQueueInitParams,
+  pub queue: Vec<IncomingGarbage>,
+  pub last_tank_time: u64,
+  pub last_column: Option<usize>,
+  pub has_changed_column: bool,
+  pub last_received_count: u64,
+  pub rng: Rng,
+  pub sent: u32,
+}
+
+impl GarbageQueue {
+  pub fn new(mut options: GarbageQueueInitParams) -> Self {
+    if options.cap.absolute == 0 {
+      options.cap.absolute = u32::MAX;
+    }
+    let rng = Rng::new(options.seed);
+    GarbageQueue {
+      options,
+      queue: Vec::new(),
+      last_tank_time: 0,
+      last_column: None,
+      has_changed_column: false,
+      last_received_count: 0,
+      rng,
+      sent: 0,
+    }
+  }
+
+  fn rngex(&mut self) -> f64 {
+    self.rng.next_float()
+  }
+
+  fn column_width(&self) -> usize {
+    self
+      .options
+      .board_width
+      .saturating_sub(self.options.garbage.hole_size as usize - 1)
+  }
+
+  fn reroll_column(&mut self) -> usize {
+    let center_buffer: usize = if self.options.messiness.center {
+      (self.options.board_width as f64 / 5.0).round() as usize
+    } else {
+      0
+    };
+
+    let col: usize = if self.options.messiness.nosame && self.last_column.is_some() {
+      let lc = self.last_column.unwrap();
+      let range = self.column_width().saturating_sub(1 + 2 * center_buffer);
+      let mut c = center_buffer + (self.rngex() * range as f64) as usize;
+      if c >= lc {
+        c += 1;
+      }
+      c
+    } else {
+      let range = self.column_width().saturating_sub(2 * center_buffer);
+      center_buffer + (self.rngex() * range as f64) as usize
+    };
+
+    self.last_column = Some(col);
+    col
+  }
+
+  pub fn size(&self) -> u32 {
+    self.queue.iter().map(|g| g.amount).sum()
+  }
+
+  pub fn receive(&mut self, garbages: Vec<IncomingGarbage>) {
+    for g in garbages {
+      if g.amount > 0 {
+        self.queue.push(g);
+      }
+    }
+
+    let cap = self.options.cap.absolute;
+    let mut total: u32 = self.queue.iter().map(|g| g.amount).sum();
+
+    while total > cap && !self.queue.is_empty() {
+      let excess = total - cap;
+      let last = self.queue.last_mut().unwrap();
+      if last.amount <= excess {
+        total -= last.amount;
+        self.queue.pop();
+      } else {
+        last.amount -= excess;
+        total -= excess;
+      }
+    }
+  }
+
+  pub fn confirm(&mut self, cid: u64, gameid: u64, frame: u64) -> bool {
+    if let Some(g) = self
+      .queue
+      .iter_mut()
+      .find(|g| g.cid == cid && g.gameid == gameid)
+    {
+      g.frame = frame;
+      g.confirmed = true;
+      true
+    } else {
+      false
+    }
+  }
+
+  pub fn cancel(
+    &mut self,
+    amount: u32,
+    piece_count: u32,
+    legacy_opener: bool,
+  ) -> (u32, Vec<IncomingGarbage>) {
+    let mut send = amount;
+    let mut cancel = 0u32;
+
+    let opener_phase = self.options.opener_phase;
+    let current_size: u32 = self.queue.iter().map(|g| g.amount).sum();
+    if piece_count + 1 <= opener_phase - (if legacy_opener { 1 } else { 0 })
+      && current_size >= self.sent
+    {
+      cancel += amount;
+    }
+
+    let mut cancelled: Vec<IncomingGarbage> = Vec::new();
+
+    while (send > 0 || cancel > 0) && !self.queue.is_empty() {
+      self.queue[0].amount -= 1;
+
+      let front_cid = self.queue[0].cid;
+      if cancelled.is_empty()
+        || cancelled.last().map(|c: &IncomingGarbage| c.cid) != Some(front_cid)
+      {
+        let mut entry = self.queue[0].clone();
+        entry.amount = 1;
+        cancelled.push(entry);
+      } else {
+        cancelled.last_mut().unwrap().amount += 1;
+      }
+
+      if self.queue[0].amount <= 0 {
+        self.queue.remove(0);
+        if self.rngex() < self.options.messiness.change {
+          self.reroll_column();
+          self.has_changed_column = true;
+        }
+      }
+
+      if send > 0 {
+        send -= 1;
+      } else {
+        cancel -= 1;
+      }
+    }
+
+    self.sent += send;
+    (send, cancelled)
+  }
+
+  pub fn tank(&mut self, frame: u64, cap: f64, hard: bool) -> Vec<OutgoingGarbage> {
+    if self.queue.is_empty() {
+      return vec![];
+    }
+
+    self.queue.sort_by_key(|g| g.frame);
+
+    if self.options.messiness.timeout > 0
+      && frame >= self.last_tank_time + self.options.messiness.timeout
+    {
+      self.reroll_column();
+      self.has_changed_column = true;
+    }
+
+    let lines = cap.min(self.options.cap.max as f64).floor() as u32;
+    let mut res: Vec<OutgoingGarbage> = Vec::new();
+
+    let mut i = 0u32;
+    while i < lines && !self.queue.is_empty() {
+      let item = &self.queue[0];
+      let speed_threshold = if hard { frame } else { frame - 1 };
+      if item.frame + self.options.garbage.speed > speed_threshold {
+        break;
+      }
+
+      let mut item = self.queue[0].clone();
+      item.amount -= 1;
+      self.queue[0].amount -= 1;
+      self.last_received_count += 1;
+
+      let col: usize = if self.last_column.is_none()
+        || (self.rngex() < self.options.messiness.within && !self.has_changed_column)
+      {
+        let c = self.reroll_column();
+        self.has_changed_column = true;
+        c
+      } else {
+        self.last_column.unwrap_or(0)
+      };
+
+      res.push(OutgoingGarbage {
+        frame: item.frame,
+        amount: 1,
+        size: item.size,
+        id: item.cid,
+        column: col,
+      });
+
+      self.has_changed_column = false;
+
+      if self.queue[0].amount <= 0 {
+        self.queue.remove(0);
+        if self.rngex() < self.options.messiness.change {
+          self.reroll_column();
+          self.has_changed_column = true;
+        }
+      }
+
+      i += 1;
+    }
+
+    res
+  }
+
+  pub fn round(&mut self, amount: f64) -> u32 {
+    match self.options.rounding {
+      RoundingMode::Down => amount.floor() as u32,
+      RoundingMode::Rng => {
+        let floored = amount.floor() as u32;
+        if amount.fract() == 0.0 {
+          floored
+        } else {
+          let decimal = amount - floored as f64;
+          floored + if self.rngex() < decimal { 1 } else { 0 }
+        }
+      }
+    }
+  }
+
+  pub fn reset(&mut self) {
+    self.queue.clear();
+  }
+
+  pub fn snapshot(&self) -> GarbageQueueSnapshot {
+    GarbageQueueSnapshot {
+      seed: self.rng.seed(),
+      last_tank_time: self.last_tank_time,
+      last_column: self.last_column,
+      sent: self.sent,
+      has_changed_column: self.has_changed_column,
+      last_received_count: self.last_received_count,
+      queue: self.queue.clone(),
+    }
+  }
+
+  pub fn from_snapshot(&mut self, snapshot: &GarbageQueueSnapshot) {
+    self.queue = snapshot.queue.clone();
+    self.last_tank_time = snapshot.last_tank_time;
+    self.last_column = snapshot.last_column;
+    self.rng = Rng::new(snapshot.seed);
+    self.sent = snapshot.sent;
+    self.has_changed_column = snapshot.has_changed_column;
+    self.last_received_count = snapshot.last_received_count;
+  }
+}
